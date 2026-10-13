@@ -1,0 +1,102 @@
+name: Pipedrive monthly export
+
+on:
+  schedule:
+    # 04:17 UTC on the 1st = 07:17 (summer) / 06:17 (winter) in Israel.
+    # Off the top of the hour: GitHub's scheduler is congested at minute 0 and may delay or drop runs.
+    - cron: '17 4 1 * *'
+  # On-demand runs: the Actions tab ("Run workflow") or the Sheet's
+  # "CRM Sync > Refresh Data Now" menu (apps_script/RefreshButton.gs).
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Skip the pre-write sanity check (only after confirming a large drop is real)'
+        type: boolean
+        default: false
+      archive:
+        description: 'Keep a dated archive copy of the current sheet first (a new month is always archived)'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry run: pull from Pipedrive and transform, write nothing'
+        type: boolean
+        default: false
+
+# Never run two exports at once (e.g. a manual run overlapping the schedule).
+concurrency:
+  group: pipedrive-export
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write   # Workload Identity Federation
+      contents: read
+      actions: write    # keepalive step below
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Run export
+        env:
+          PYTHONPATH: src
+          PIPEDRIVE_API_KEY: ${{ secrets.PIPEDRIVE_API_KEY }}
+          TARGET_FOLDER_ID: ${{ secrets.TARGET_FOLDER_ID }}
+          ARCHIVE_FOLDER_ID: ${{ secrets.ARCHIVE_FOLDER_ID }}
+          PIPEDRIVE_HEADCOUNT_FIELD_KEY: ${{ secrets.PIPEDRIVE_HEADCOUNT_FIELD_KEY }}
+          DASHBOARD_LOGO_URL: ${{ secrets.DASHBOARD_LOGO_URL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+          ARCHIVE: ${{ inputs.archive }}
+        run: |
+          args=""
+          if [ "$DRY_RUN" = "true" ]; then args="$args --dry-run"; fi
+          if [ "$FORCE" = "true" ]; then args="$args --force"; fi
+          if [ "$ARCHIVE" = "true" ]; then args="$args --archive"; fi
+          python -m pipedrive_export.main $args
+
+      # GitHub disables scheduled workflows after 60 days without repository activity.
+      # Re-enabling this workflow through the API on every run resets that clock.
+      - name: Keep schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/pipedrive-upload.yml/enable"
+
+      # Scheduled-run failure emails go only to whoever last edited the cron line,
+      # so post failures to a shared channel. Skipped until the secret exists.
+      - name: Notify on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping notification."
+            exit 0
+          fi
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\": \":warning: Pipedrive monthly export failed: $RUN_URL\"}" \
+            "$SLACK_WEBHOOK_URL"
